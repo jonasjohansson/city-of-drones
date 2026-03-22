@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>City of Drones – Three.js Recreation</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; }
+    canvas { display: block; }
+    #info {
+      position: fixed;
+      bottom: 20px;
+      left: 20px;
+      color: rgba(255,255,255,0.5);
+      font-family: 'Helvetica Neue', Arial, sans-serif;
+      font-size: 12px;
+      z-index: 10;
+      pointer-events: none;
+    }
+    #title {
+      position: fixed;
+      bottom: 40px;
+      left: 20px;
+      color: rgba(255,255,255,0.8);
+      font-family: 'Helvetica Neue', Arial, sans-serif;
+      font-size: 32px;
+      font-weight: 300;
+      z-index: 10;
+      pointer-events: none;
+      letter-spacing: -0.5px;
+    }
+  </style>
+</head>
+<body>
+  <div id="title">City of Drones</div>
+  <div id="info">Click to start · Mouse to look · WASD to move</div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    }
+  }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+    import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+    import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+    import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+    import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
+    import { BokehPass } from 'three/addons/postprocessing/BokehPass.js';
+    import { AfterimagePass } from 'three/addons/postprocessing/AfterimagePass.js';
+    import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
+    import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+    // --- Config ---
+    const CONFIG = {
+      panelDensity: 50,
+      cityRadius: 180,
+      streetWidth: 12,
+      maxBuildingHeight: 180,
+      minBuildingHeight: 30,
+      mouseSmoothing: 0.03,
+    };
+
+    // --- Color palette ---
+    const PALETTES = [
+      [0xd4a843, 0xc4913a, 0xe8c85a, 0xf0d060, 0xa87830, 0xffeebb, 0xddbb66],
+      [0x00cccc, 0x00aadd, 0x44eeff, 0x22ddcc],
+      [0xffffff, 0xeeeedd, 0xccccbb, 0xaaaaaa, 0x888877],
+      [0xff4444, 0xff8800, 0x44cc44, 0x4488ff, 0xffff44],
+    ];
+
+    function pickColor() {
+      const roll = Math.random();
+      let palette;
+      if (roll < 0.4) palette = PALETTES[0];
+      else if (roll < 0.55) palette = PALETTES[1];
+      else if (roll < 0.8) palette = PALETTES[2];
+      else palette = PALETTES[3];
+      return palette[Math.floor(Math.random() * palette.length)];
+    }
+
+    // --- Scene ---
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x040408);
+    scene.fog = new THREE.FogExp2(0x040408, 0.003);
+
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.5, 800);
+    camera.position.set(0, 20, 0);
+
+    // No built-in AA — SMAA handles it
+    const renderer = new THREE.WebGLRenderer({ powerPreference: 'high-performance' });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 2.0;
+    document.body.appendChild(renderer.domElement);
+
+    // --- Procedural env map ---
+    const pmremGenerator = new THREE.PMREMGenerator(renderer);
+    pmremGenerator.compileEquirectangularShader();
+    {
+      const envScene = new THREE.Scene();
+      envScene.background = new THREE.Color(0x151520);
+      const envGeo = new THREE.BoxGeometry(1, 1, 1);
+      const envColors = [0xffcc66, 0x00cccc, 0xffffff, 0xff8844, 0x4488ff, 0xffee88, 0xffeedd, 0xdddddd];
+      for (let i = 0; i < 80; i++) {
+        const c = envColors[Math.floor(Math.random() * envColors.length)];
+        const m = new THREE.MeshBasicMaterial({ color: c });
+        const mesh = new THREE.Mesh(envGeo, m);
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.random() * Math.PI;
+        const r = 50;
+        mesh.position.set(r * Math.sin(phi) * Math.cos(theta), r * Math.cos(phi), r * Math.sin(phi) * Math.sin(theta));
+        mesh.scale.set(3 + Math.random() * 10, 1 + Math.random() * 6, 0.5);
+        mesh.lookAt(0, 0, 0);
+        envScene.add(mesh);
+      }
+      const envMap = pmremGenerator.fromScene(envScene, 0.04).texture;
+      scene.environment = envMap;
+      envScene.traverse(child => {
+        if (child.geometry) child.geometry.dispose();
+        if (child.material) child.material.dispose();
+      });
+      pmremGenerator.dispose();
+    }
+
+    // ============================================================
+    // POST-PROCESSING CHAIN
+    // Order: Render → GTAO → Bloom → Afterimage → Bokeh → SMAA → FilmGrainColorGrade → Output
+    // ============================================================
+    const composer = new EffectComposer(renderer);
+
+    // 1. Render pass
+    const renderPass = new RenderPass(scene, camera);
+    composer.addPass(renderPass);
+
+    // 2. GTAO — ambient occlusion (contact shadows between panels)
+    const gtaoPass = new GTAOPass(scene, camera, window.innerWidth, window.innerHeight);
+    gtaoPass.output = GTAOPass.OUTPUT.Default;
+    gtaoPass.blendIntensity = 1.0;
+    // Tuned for architectural scale
+    if (gtaoPass.uniforms) {
+      // These may vary by Three.js version
+    }
+    composer.addPass(gtaoPass);
+
+    // 3. Bloom — glow on emissive panels
+    const bloom = new UnrealBloomPass(
+      new THREE.Vector2(window.innerWidth, window.innerHeight),
+      0.5, 0.3, 0.85
+    );
+    composer.addPass(bloom);
+
+    // 4. Afterimage — motion blur / ghosting trail
+    const afterimage = new AfterimagePass(0.85);
+    composer.addPass(afterimage);
+
+    // 5. Bokeh — depth of field
+    const bokeh = new BokehPass(scene, camera, {
+      focus: 60.0,
+      aperture: 0.00015,
+      maxblur: 0.008,
+    });
+    composer.addPass(bokeh);
+
+    // 6. SMAA — anti-aliasing (better than FXAA, cheaper than MSAA)
+    const smaa = new SMAAPass(
+      window.innerWidth * renderer.getPixelRatio(),
+      window.innerHeight * renderer.getPixelRatio()
+    );
+    composer.addPass(smaa);
+
+    // 7. Combined: film grain + chromatic aberration + vignette + color grading
+    const filmGradeShader = {
+      uniforms: {
+        tDiffuse: { value: null },
+        time: { value: 0 },
+        // Vignette
+        vigDarkness: { value: 1.2 },
+        vigOffset: { value: 1.0 },
+        // Chromatic aberration
+        chromaticStrength: { value: 0.0025 },
+        // Film grain
+        grainIntensity: { value: 0.03 },
+        grainSize: { value: 1.5 },
+        // Color grading
+        lift: { value: new THREE.Vector3(0.02, 0.02, 0.04) },   // shadow tint (cool)
+        gamma: { value: new THREE.Vector3(1.0, 0.98, 0.95) },    // midtone balance
+        gain: { value: new THREE.Vector3(1.05, 1.02, 0.95) },    // highlight warmth
+        saturation: { value: 1.15 },
+        contrast: { value: 1.08 },
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
+      `,
+      fragmentShader: `
+        uniform sampler2D tDiffuse;
+        uniform float time;
+        uniform float vigDarkness, vigOffset;
+        uniform float chromaticStrength;
+        uniform float grainIntensity, grainSize;
+        uniform vec3 lift, gamma, gain;
+        uniform float saturation, contrast;
+        varying vec2 vUv;
+
+        // Hash for grain
+        float hash(vec2 p) {
+          vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+          p3 += dot(p3, p3.yzx + 33.33);
+          return fract((p3.x + p3.y) * p3.z);
+        }
+
+        vec3 liftGammaGain(vec3 color, vec3 l, vec3 g, vec3 ga) {
+          // Lift: shadows
+          color = color * (1.0 - l) + l;
+          // Gamma: midtones
+          color = pow(max(color, vec3(0.0)), 1.0 / g);
+          // Gain: highlights
+          color *= ga;
+          return color;
+        }
+
+        void main() {
+          vec2 dir = vUv - vec2(0.5);
+          float dist = length(dir);
+
+          // --- Chromatic aberration (increases toward edges) ---
+          float caScale = chromaticStrength * (1.0 + dist * 2.0);
+          float r = texture2D(tDiffuse, vUv + dir * caScale).r;
+          float g = texture2D(tDiffuse, vUv).g;
+          float b = texture2D(tDiffuse, vUv - dir * caScale).b;
+          vec3 color = vec3(r, g, b);
+
+          // --- Contrast (around mid-gray) ---
+          color = (color - 0.5) * contrast + 0.5;
+
+          // --- Lift / Gamma / Gain color grading ---
+          color = liftGammaGain(color, lift, gamma, gain);
+
+          // --- Saturation ---
+          float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+          color = mix(vec3(luma), color, saturation);
+
+          // --- Vignette ---
+          vec2 uvVig = (vUv - vec2(0.5)) * vec2(vigOffset);
+          color *= 1.0 - dot(uvVig, uvVig) * vigDarkness;
+
+          // --- Film grain ---
+          vec2 grainUv = vUv * vec2(textureSize(tDiffuse, 0)) / grainSize;
+          float grain = hash(grainUv + fract(time)) * 2.0 - 1.0;
+          color += grain * grainIntensity;
+
+          color = clamp(color, 0.0, 1.0);
+          gl_FragColor = vec4(color, 1.0);
+        }
+      `,
+    };
+    const filmGradePass = new ShaderPass(filmGradeShader);
+    composer.addPass(filmGradePass);
+
+    // 8. Output pass — proper sRGB conversion (always last)
+    const outputPass = new OutputPass();
+    composer.addPass(outputPass);
+
+    // --- Lights ---
+    scene.add(new THREE.AmbientLight(0x556677, 1.0));
+    const dirLight = new THREE.DirectionalLight(0xffeedd, 2.0);
+    dirLight.position.set(50, 120, 30);
+    scene.add(dirLight);
+    const fillLight = new THREE.DirectionalLight(0x88aacc, 0.8);
+    fillLight.position.set(-40, 80, -50);
+    scene.add(fillLight);
+
+    const pointLights = [];
+    const plColors = [0x00cccc, 0xff8800, 0xffee44, 0x4488ff, 0xff4466, 0xffeedd, 0x44ffaa, 0xffcc44];
+    for (let i = 0; i < 8; i++) {
+      const pl = new THREE.PointLight(plColors[i], 5 + Math.random() * 5, 120);
+      pl.position.set(
+        (Math.random() - 0.5) * CONFIG.cityRadius * 0.8,
+        10 + Math.random() * 80,
+        (Math.random() - 0.5) * CONFIG.cityRadius * 0.8
+      );
+      scene.add(pl);
+      pointLights.push(pl);
+    }
+
+    // --- Ground ---
+    const groundGeo = new THREE.PlaneGeometry(500, 500);
+    const ground = new THREE.Mesh(groundGeo, new THREE.MeshStandardMaterial({
+      color: 0x181820,
+      metalness: 0.95,
+      roughness: 0.05,
+      envMapIntensity: 3.0,
+    }));
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = -1;
+    scene.add(ground);
+
+    // --- Shared geometry ---
+    const panelGeo = new THREE.PlaneGeometry(1, 1);
+    const boxGeo = new THREE.BoxGeometry(1, 1, 1);
+
+    // --- Material cache ---
+    const materialCache = [];
+    function getCachedMaterial() {
+      if (materialCache.length < 60) {
+        const color = pickColor();
+        const isEmissive = Math.random() < 0.3;
+        const mat = new THREE.MeshStandardMaterial({
+          color,
+          metalness: 0.5 + Math.random() * 0.5,
+          roughness: 0.02 + Math.random() * 0.2,
+          transparent: Math.random() < 0.25,
+          opacity: 0.5 + Math.random() * 0.5,
+          side: THREE.DoubleSide,
+          emissive: isEmissive ? new THREE.Color(color).multiplyScalar(0.4) : new THREE.Color(0x000000),
+          emissiveIntensity: isEmissive ? 0.8 + Math.random() * 1.5 : 0,
+          envMapIntensity: 2.0 + Math.random() * 2.0,
+        });
+        materialCache.push(mat);
+        return mat;
+      }
+      return materialCache[Math.floor(Math.random() * materialCache.length)];
+    }
+
+    const beamMaterials = [];
+    for (let i = 0; i < 10; i++) {
+      const isCyan = Math.random() < 0.4;
+      const c = isCyan ? 0x00cccc : pickColor();
+      beamMaterials.push(new THREE.MeshStandardMaterial({
+        color: c, metalness: 0.8, roughness: 0.05,
+        emissive: isCyan ? new THREE.Color(0x00cccc) : new THREE.Color(0x000000),
+        emissiveIntensity: isCyan ? 2.0 : 0, envMapIntensity: 2.5,
+      }));
+    }
+
+    const coreMat = new THREE.MeshStandardMaterial({
+      color: 0x151520, metalness: 0.7, roughness: 0.08,
+      transparent: true, opacity: 0.6, envMapIntensity: 2.5,
+    });
+
+    const stripMaterials = [];
+    for (const sc of [0xffeedd, 0x00cccc, 0xffcc44, 0xffffff, 0x88ddff]) {
+      stripMaterials.push(new THREE.MeshStandardMaterial({
+        color: sc, emissive: new THREE.Color(sc), emissiveIntensity: 2.0,
+        metalness: 0.1, roughness: 0.1, transparent: true, opacity: 0.7,
+      }));
+    }
+
+    const poleMat = new THREE.MeshStandardMaterial({
+      color: 0xaaaaaa, metalness: 0.9, roughness: 0.05, envMapIntensity: 2.5,
+    });
+
+    // --- Buildings ---
+    const blockSize = 30;
+    const gridCount = 7;
+    const halfGrid = (gridCount * (blockSize + CONFIG.streetWidth)) / 2;
+    const buildingGroup = new THREE.Group();
+    scene.add(buildingGroup);
+
+    function createBuilding(cx, cz) {
+      const bw = 5 + Math.random() * 15;
+      const bd = 5 + Math.random() * 15;
+      const bh = CONFIG.minBuildingHeight + Math.random() * (CONFIG.maxBuildingHeight - CONFIG.minBuildingHeight);
+      const group = new THREE.Group();
+      group.position.set(cx, 0, cz);
+
+      const core = new THREE.Mesh(boxGeo, coreMat);
+      core.scale.set(bw * 0.8, bh, bd * 0.8);
+      core.position.y = bh / 2;
+      group.add(core);
+
+      const panelCount = CONFIG.panelDensity + Math.floor(Math.random() * 30);
+      for (let i = 0; i < panelCount; i++) {
+        const side = Math.floor(Math.random() * 4);
+        const pw = 1 + Math.random() * 6;
+        const ph = 0.5 + Math.random() * 4;
+        const py = Math.random() * bh;
+        let px, pz, ry;
+        const offset = 0.1 + Math.random() * 2;
+        switch (side) {
+          case 0: px = bw / 2 + offset; pz = (Math.random() - 0.5) * bd; ry = Math.PI / 2; break;
+          case 1: px = -bw / 2 - offset; pz = (Math.random() - 0.5) * bd; ry = -Math.PI / 2; break;
+          case 2: px = (Math.random() - 0.5) * bw; pz = bd / 2 + offset; ry = 0; break;
+          case 3: px = (Math.random() - 0.5) * bw; pz = -bd / 2 - offset; ry = Math.PI; break;
+        }
+        const isBox = Math.random() < 0.2;
+        const panel = new THREE.Mesh(isBox ? boxGeo : panelGeo, getCachedMaterial());
+        panel.scale.set(pw, ph, isBox ? (0.2 + Math.random() * 1.5) : 1);
+        panel.position.set(px, py, pz);
+        panel.rotation.y = ry;
+        panel.rotation.x += (Math.random() - 0.5) * 0.15;
+        panel.rotation.z += (Math.random() - 0.5) * 0.1;
+        group.add(panel);
+      }
+
+      const beamCount = 2 + Math.floor(Math.random() * 4);
+      for (let i = 0; i < beamCount; i++) {
+        const bLen = bw + Math.random() * 25;
+        const beam = new THREE.Mesh(boxGeo, beamMaterials[Math.floor(Math.random() * beamMaterials.length)]);
+        beam.scale.set(bLen, 0.12 + Math.random() * 0.25, 0.12 + Math.random() * 0.25);
+        beam.position.set(
+          (Math.random() - 0.5) * bw * 0.5,
+          5 + Math.random() * bh * 0.9,
+          (Math.random() - 0.5) * bd
+        );
+        beam.rotation.y = (Math.random() - 0.5) * 0.5;
+        beam.rotation.z = (Math.random() - 0.5) * 0.3;
+        group.add(beam);
+      }
+
+      if (Math.random() < 0.4) {
+        const pole = new THREE.Mesh(boxGeo, poleMat);
+        const poleH = bh + 10 + Math.random() * 30;
+        pole.scale.set(0.15, poleH, 0.15);
+        pole.position.set((Math.random() - 0.5) * bw * 0.5, poleH / 2, (Math.random() - 0.5) * bd * 0.5);
+        group.add(pole);
+      }
+
+      const stripCount = 3 + Math.floor(Math.random() * 5);
+      for (let i = 0; i < stripCount; i++) {
+        const side = Math.floor(Math.random() * 4);
+        const sw = 2 + Math.random() * (bw * 0.6);
+        const sh = 0.3 + Math.random() * 1.2;
+        const sy = 5 + Math.random() * (bh - 10);
+        let sx, sz, sry;
+        switch (side) {
+          case 0: sx = bw * 0.41; sz = (Math.random() - 0.5) * bd * 0.6; sry = Math.PI / 2; break;
+          case 1: sx = -bw * 0.41; sz = (Math.random() - 0.5) * bd * 0.6; sry = -Math.PI / 2; break;
+          case 2: sx = (Math.random() - 0.5) * bw * 0.6; sz = bd * 0.41; sry = 0; break;
+          case 3: sx = (Math.random() - 0.5) * bw * 0.6; sz = -bd * 0.41; sry = Math.PI; break;
+        }
+        const strip = new THREE.Mesh(panelGeo, stripMaterials[Math.floor(Math.random() * stripMaterials.length)]);
+        strip.scale.set(sw, sh, 1);
+        strip.position.set(sx, sy, sz);
+        strip.rotation.y = sry;
+        group.add(strip);
+      }
+
+      buildingGroup.add(group);
+    }
+
+    for (let gx = 0; gx < gridCount; gx++) {
+      for (let gz = 0; gz < gridCount; gz++) {
+        const blockCenterX = gx * (blockSize + CONFIG.streetWidth) - halfGrid;
+        const blockCenterZ = gz * (blockSize + CONFIG.streetWidth) - halfGrid;
+        const bCount = 2 + Math.floor(Math.random() * 3);
+        for (let b = 0; b < bCount; b++) {
+          createBuilding(
+            blockCenterX + (Math.random() - 0.5) * blockSize * 0.8,
+            blockCenterZ + (Math.random() - 0.5) * blockSize * 0.8
+          );
+        }
+      }
+    }
+
+    // --- Floating debris ---
+    const floatingObjects = [];
+    for (let i = 0; i < 200; i++) {
+      const mesh = new THREE.Mesh(Math.random() < 0.3 ? boxGeo : panelGeo, getCachedMaterial());
+      mesh.scale.set(
+        0.5 + Math.random() * 5, 0.5 + Math.random() * 3,
+        Math.random() < 0.3 ? 0.5 + Math.random() * 2 : 1
+      );
+      mesh.position.set(
+        (Math.random() - 0.5) * CONFIG.cityRadius * 1.5,
+        5 + Math.random() * 150,
+        (Math.random() - 0.5) * CONFIG.cityRadius * 1.5
+      );
+      mesh.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
+      mesh.userData.floatSpeed = 0.001 + Math.random() * 0.003;
+      mesh.userData.floatOffset = Math.random() * Math.PI * 2;
+      scene.add(mesh);
+      floatingObjects.push(mesh);
+    }
+
+    // --- Wire lines ---
+    const wireMat = new THREE.LineBasicMaterial({ color: 0x667777, transparent: true, opacity: 0.5 });
+    for (let i = 0; i < 60; i++) {
+      const sx = (Math.random() - 0.5) * CONFIG.cityRadius;
+      const sz = (Math.random() - 0.5) * CONFIG.cityRadius;
+      const sy = 10 + Math.random() * 120;
+      const geo = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(sx, sy, sz),
+        new THREE.Vector3(sx + (Math.random() - 0.5) * 60, sy + (Math.random() - 0.5) * 30, sz + (Math.random() - 0.5) * 60),
+      ]);
+      scene.add(new THREE.Line(geo, wireMat));
+    }
+
+    // --- Camera path ---
+    const pathPoints = [];
+    for (let i = 0; i < 20; i++) {
+      const t = i / 20;
+      const angle = t * Math.PI * 4;
+      const radius = 20 + Math.sin(t * Math.PI * 3) * 40;
+      pathPoints.push(new THREE.Vector3(
+        Math.cos(angle) * radius,
+        8 + Math.sin(t * Math.PI * 2) * 40 + t * 60,
+        Math.sin(angle) * radius
+      ));
+    }
+    const cameraPath = new THREE.CatmullRomCurve3(pathPoints, true);
+
+    // --- Controls ---
+    let mouseX = 0, mouseY = 0, smoothMouseX = 0, smoothMouseY = 0;
+    let isPointerLocked = false, manualMode = false;
+    const direction = new THREE.Vector3();
+    const keys = { w: false, a: false, s: false, d: false, shift: false, space: false };
+    let euler = new THREE.Euler(0, 0, 0, 'YXZ');
+
+    document.addEventListener('click', () => {
+      if (!isPointerLocked) renderer.domElement.requestPointerLock();
+    });
+    document.addEventListener('pointerlockchange', () => {
+      isPointerLocked = document.pointerLockElement === renderer.domElement;
+      if (isPointerLocked) {
+        manualMode = true;
+        euler.setFromQuaternion(camera.quaternion);
+        document.getElementById('info').textContent = 'WASD to move · Mouse to look · ESC for auto-fly';
+      } else {
+        manualMode = false;
+        document.getElementById('info').textContent = 'Click to start · Mouse to look · WASD to move';
+      }
+    });
+    document.addEventListener('mousemove', (e) => {
+      if (isPointerLocked) {
+        euler.y -= e.movementX * 0.002;
+        euler.x -= e.movementY * 0.002;
+        euler.x = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, euler.x));
+        camera.quaternion.setFromEuler(euler);
+      } else {
+        mouseX = (e.clientX / window.innerWidth - 0.5) * 2;
+        mouseY = (e.clientY / window.innerHeight - 0.5) * 2;
+      }
+    });
+    document.addEventListener('keydown', (e) => {
+      const k = e.key.toLowerCase();
+      if (k in keys) keys[k] = true;
+      if (k === ' ') keys.space = true;
+    });
+    document.addEventListener('keyup', (e) => {
+      const k = e.key.toLowerCase();
+      if (k in keys) keys[k] = false;
+      if (k === ' ') keys.space = false;
+    });
+
+    // --- Animation ---
+    let pathT = 0;
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const dt = clock.getDelta();
+      const elapsed = clock.getElapsedTime();
+
+      // Update film grain time
+      filmGradePass.uniforms.time.value = elapsed;
+
+      if (manualMode) {
+        const speed = (keys.shift ? 60 : 30) * dt;
+        direction.set(0, 0, 0);
+        if (keys.w) direction.z -= 1;
+        if (keys.s) direction.z += 1;
+        if (keys.a) direction.x -= 1;
+        if (keys.d) direction.x += 1;
+        if (keys.space) camera.position.y += speed;
+        direction.normalize();
+        direction.applyQuaternion(camera.quaternion);
+        camera.position.addScaledVector(direction, speed);
+      } else {
+        pathT += dt * 0.015;
+        if (pathT > 1) pathT -= 1;
+        const pos = cameraPath.getPointAt(pathT % 1);
+        const lookAt = cameraPath.getPointAt((pathT + 0.01) % 1);
+        camera.position.lerp(pos, 0.02);
+        smoothMouseX += (mouseX - smoothMouseX) * CONFIG.mouseSmoothing;
+        smoothMouseY += (mouseY - smoothMouseY) * CONFIG.mouseSmoothing;
+        const target = lookAt.clone();
+        target.x += smoothMouseX * 20;
+        target.y += smoothMouseY * 10;
+        camera.lookAt(target);
+      }
+
+      for (const obj of floatingObjects) {
+        obj.position.y += Math.sin(elapsed * obj.userData.floatSpeed * 100 + obj.userData.floatOffset) * 0.02;
+        obj.rotation.y += obj.userData.floatSpeed * 0.5;
+      }
+
+      composer.render();
+    }
+
+    window.addEventListener('resize', () => {
+      const w = window.innerWidth, h = window.innerHeight;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+      composer.setSize(w, h);
+      smaa.setSize(w * renderer.getPixelRatio(), h * renderer.getPixelRatio());
+    });
+
+    animate();
+  </script>
+</body>
+</html>
